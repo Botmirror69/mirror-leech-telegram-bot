@@ -1,15 +1,14 @@
 from logging import getLogger, ERROR, DEBUG
-from time import time, sleep
-from pickle import load as pload, dump as pdump
+from time import time
+from pickle import load as pload
 from json import loads as jsnloads
 from os import makedirs, path as ospath, listdir
 from requests.utils import quote as rquote
 from io import FileIO
 from re import search as re_search
+from urllib.parse import parse_qs, urlparse
 from random import randrange
-from google.auth.transport.requests import Request
 from google.oauth2 import service_account
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
@@ -62,8 +61,6 @@ class GoogleDriveHelper:
         self.updater = None
         self.name = name
         self.update_interval = 3
-        self.telegraph_content = []
-        self.path = []
         self.__total_bytes = 0
         self.__total_files = 0
         self.__total_folders = 0
@@ -95,11 +92,14 @@ class GoogleDriveHelper:
 
     @staticmethod
     def __getIdFromUrl(link: str):
-        regex = r"https:\/\/drive\.google\.com\/(?:open(.*?)id\=|drive(.*?)\/folders\/|file(.*?)?\/d\/|folderview(.*?)id\=|uc(.*?)id\=)([-\w]+)"
-        res = re_search(regex,link)
-        if res is None:
-            raise IndexError("G-Drive ID not found.")
-        return res.group(6)
+        if "folders" in link or "file" in link:
+            regex = r"https:\/\/drive\.google\.com\/(?:drive(.*?)\/folders\/|file(.*?)?\/d\/)([-\w]+)"
+            res = re_search(regex,link)
+            if res is None:
+                raise IndexError("G-Drive ID not found.")
+            return res.group(3)
+        parsed = urlparse(link)
+        return parse_qs(parsed.query)['id'][0]
 
     @retry(wait=wait_exponential(multiplier=2, min=3, max=6), stop=stop_after_attempt(3),
            retry=retry_if_exception_type(HttpError), before=before_log(LOGGER, DEBUG))
@@ -118,7 +118,7 @@ class GoogleDriveHelper:
             return msg
         msg = ''
         try:
-            res = self.__service.files().delete(fileId=file_id, supportsTeamDrives=IS_TEAM_DRIVE).execute()
+            self.__service.files().delete(fileId=file_id, supportsTeamDrives=IS_TEAM_DRIVE).execute()
             msg = "Successfully deleted"
             LOGGER.info(f"Delete Result: {msg}")
         except HttpError as err:
@@ -422,7 +422,7 @@ class GoogleDriveHelper:
                 file_path = ospath.join(local_path, file.get('name'))
                 current_dir_id = self.__create_directory(file.get('name'), parent_id)
                 self.__cloneFolder(file.get('name'), file_path, file.get('id'), current_dir_id)
-            else:
+            elif not file.get('name').lower().endswith(tuple(EXTENTION_FILTER)):
                 self.__total_files += 1
                 self.transferred_size += int(file.get('size', 0))
                 self.__copyFile(file.get('id'), parent_id)
@@ -452,14 +452,12 @@ class GoogleDriveHelper:
             return parent_id
         new_id = None
         for item in list_dirs:
-            if item.endswith(tuple(EXTENTION_FILTER)):
-                continue
             current_file_name = ospath.join(input_directory, item)
             if ospath.isdir(current_file_name):
                 current_dir_id = self.__create_directory(item, parent_id)
                 new_id = self.__upload_dir(current_file_name, current_dir_id)
                 self.__total_folders += 1
-            else:
+            elif not item.lower().endswith(tuple(EXTENTION_FILTER)):
                 mime_type = get_mime_type(current_file_name)
                 file_name = current_file_name.split("/")[-1]
                 # current_file_name will have the full path
@@ -602,6 +600,8 @@ class GoogleDriveHelper:
         msg = ""
         fileName = self.__escapes(str(fileName))
         contents_count = 0
+        telegraph_content = []
+        path = []
         Title = False
         if len(DRIVES_IDS) > 1:
             token_service = self.__alt_authorize()
@@ -665,31 +665,30 @@ class GoogleDriveHelper:
                 msg += '<br><br>'
                 contents_count += 1
                 if len(msg.encode('utf-8')) > 39000:
-                    self.telegraph_content.append(msg)
+                    telegraph_content.append(msg)
                     msg = ""
             if noMulti:
                 break
 
         if msg != '':
-            self.telegraph_content.append(msg)
+            telegraph_content.append(msg)
 
-        if len(self.telegraph_content) == 0:
+        if len(telegraph_content) == 0:
             return "", None
 
-        for content in self.telegraph_content:
-            self.path.append(
+        for content in telegraph_content:
+            path.append(
                 telegraph.create_page(
                     title='Mirror-Leech-Bot Drive Search',
                     content=content
                 )["path"]
             )
-        sleep(0.5)
-        if len(self.path) > 1:
-            telegraph.edit_telegraph(self.path, self.telegraph_content)
+        if len(path) > 1:
+            telegraph.edit_telegraph(path, telegraph_content)
 
         msg = f"<b>Found {contents_count} result for <i>{fileName}</i></b>"
         buttons = ButtonMaker()
-        buttons.buildbutton("🔎 VIEW", f"https://telegra.ph/{self.path[0]}")
+        buttons.buildbutton("🔎 VIEW", f"https://telegra.ph/{path[0]}")
 
         return msg, InlineKeyboardMarkup(buttons.build_menu(1))
 
@@ -849,7 +848,7 @@ class GoogleDriveHelper:
                 mime_type = item.get('mimeType')
             if mime_type == self.__G_DRIVE_DIR_MIME_TYPE:
                 self.__download_folder(file_id, path, filename)
-            elif not ospath.isfile(path + filename):
+            elif not ospath.isfile(path + filename) and not filename.lower().endswith(tuple(EXTENTION_FILTER)):
                 self.__download_file(file_id, path, filename, mime_type)
             if self.is_cancelled:
                 break
